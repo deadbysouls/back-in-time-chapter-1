@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Back in Time - Chapter 1</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07080f; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { width: min(100vw, 177.7vh); aspect-ratio: 16 / 9; touch-action: none; display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const W = 960, H = 540;
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const dpr = Math.min(window.devicePixelRatio || 1, 2);
+cv.width = W * dpr; cv.height = H * dpr; ctx.scale(dpr, dpr);
+const FONT = '"Trebuchet MS", system-ui, sans-serif';
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+let scene = 'intro', mouse = { x: 0, y: 0, down: false }, keys = {};
+let timer = 0, noteText = '', lvl = 0, L, player, mons, objs, drag = null;
+let doorOpen = false, doorT = 0, puzzleT = 0;
+
+// ---------- chapter data ----------
+const LEVELS = [
+  { walls: [[200,0,20,380],[420,160,20,380],[640,0,20,380],[260,250,40,40],[470,300,40,40]],
+    start: [70,70], exit: [880,30,60,60],
+    mons: [[[370,470],[370,60]], [[580,60],[580,330]], [[700,120],[920,120],[920,300],[700,300]]],
+    note: { x: 540, y: 490, got: false, text: 'Deep scratches in the floorboards. Whatever made them has very long fingers.' } },
+  { walls: [[180,200,220,50],[560,250,120,80],[380,0,40,140],[700,120,20,260],[250,400,40,40]],
+    start: [50,500], exit: [880,30,60,60],
+    mons: [[[500,170],[500,460],[100,460],[100,170]], [[830,470],[830,150]]],
+    note: { x: 300, y: 490, got: false, text: "Dad's old phone. One bar of signal. First I have to find out what they are. Then I call the police." } }
+];
+
+// ---------- puzzle room ----------
+const room = { l: 40, r: 920, t: 40, b: 480 };
+const desk = { x: 330, y: 390, w: 180, h: 90 };
+const btn = { x: 900, y: 110, w: 20, h: 44 };
+const door = { x: 40, y: 360, w: 14, h: 120 };
+
+function initPuzzle() {
+  objs = [
+    { x: 200, y: 300, vx: 0, vy: 0, r: 16, m: 1,   c: '#ff6b6b' },
+    { x: 300, y: 300, vx: 0, vy: 0, r: 24, m: 2.5, c: '#ffd24d' },
+    { x: 120, y: 300, vx: 0, vy: 0, r: 30, m: 5,   c: '#6bc5ff' }
+  ];
+  doorOpen = false; doorT = 0; puzzleT = 0; drag = null;
+}
+
+function physics(dt) {
+  for (const o of objs) {
+    if (o === drag) {
+      o.vx += ((mouse.x - o.x) * 45 - o.vx * 9) / o.m * dt;
+      o.vy += ((mouse.y - o.y) * 45 - o.vy * 9) / o.m * dt;
+    }
+    o.vy += 1400 * dt;
+    const sp = Math.hypot(o.vx, o.vy);
+    if (sp > 1100) { o.vx *= 1100 / sp; o.vy *= 1100 / sp; }
+    o.x += o.vx * dt; o.y += o.vy * dt;
+    if (o.x < room.l + o.r) { o.x = room.l + o.r; o.vx = Math.abs(o.vx) * 0.5; }
+    if (o.x > room.r - o.r) { o.x = room.r - o.r; o.vx = -Math.abs(o.vx) * 0.5; }
+    if (o.y < room.t + o.r) { o.y = room.t + o.r; o.vy = Math.abs(o.vy) * 0.5; }
+    if (o.y > room.b - o.r) {
+      o.y = room.b - o.r; o.vy = -Math.abs(o.vy) * 0.45; o.vx *= 1 - 1.2 * dt;
+      if (Math.abs(o.vy) < 30) o.vy = 0;
+    }
+    // desk collision
+    const cx = clamp(o.x, desk.x, desk.x + desk.w), cy = clamp(o.y, desk.y, desk.y + desk.h);
+    const dx = o.x - cx, dy = o.y - cy, d = Math.hypot(dx, dy);
+    if (d < o.r && d > 0) {
+      const nx = dx / d, ny = dy / d;
+      o.x += nx * (o.r - d); o.y += ny * (o.r - d);
+      const vn = o.vx * nx + o.vy * ny;
+      if (vn < 0) { o.vx -= 1.45 * vn * nx; o.vy -= 1.45 * vn * ny; }
+    } else if (d === 0) o.y = desk.y - o.r;
+    // red button: needs a hard hit
+    const bx = clamp(o.x, btn.x, btn.x + btn.w), by = clamp(o.y, btn.y, btn.y + btn.h);
+    if (!doorOpen && Math.hypot(o.x - bx, o.y - by) < o.r + 1 && Math.hypot(o.vx, o.vy) > 250) doorOpen = true;
+  }
+  for (let i = 0; i < objs.length; i++) for (let j = i + 1; j < objs.length; j++) {
+    const a = objs[i], b = objs[j], dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1;
+    if (d < a.r + b.r) {
+      const nx = dx / d, ny = dy / d, ov = a.r + b.r - d, tm = a.m + b.m;
+      a.x -= nx * ov * b.m / tm; a.y -= ny * ov * b.m / tm;
+      b.x += nx * ov * a.m / tm; b.y += ny * ov * a.m / tm;
+      const vn = (a.vx - b.vx) * nx + (a.vy - b.vy) * ny;
+      if (vn > 0) {
+        const j2 = 1.5 * vn / (1 / a.m + 1 / b.m);
+        a.vx -= j2 / a.m * nx; a.vy -= j2 / a.m * ny;
+        b.vx += j2 / b.m * nx; b.vy += j2 / b.m * ny;
+      }
+    }
+  }
+}
+
+// ---------- survival levels ----------
+function loadLevel(i) {
+  lvl = i; L = LEVELS[i];
+  player = { x: L.start[0], y: L.start[1] };
+  mons = L.mons.map(p => ({ x: p[0][0], y: p[0][1], path: p, i: 1, chase: false, lost: 0 }));
+  scene = 'play';
+}
+
+function move(e, dx, dy, r) {
+  e.x = clamp(e.x + dx, r, W - r); e.y = clamp(e.y + dy, r, H - r);
+  for (const w of L.walls) {
+    const cx = clamp(e.x, w[0], w[0] + w[2]), cy = clamp(e.y, w[1], w[1] + w[3]);
+    const ex = e.x - cx, ey = e.y - cy, d = Math.hypot(ex, ey);
+    if (d < r) { if (d > 0) { e.x += ex / d * (r - d); e.y += ey / d * (r - d); } else e.x += r; }
+  }
+}
+
+function los(a, b) {
+  const d = Math.hypot(b.x - a.x, b.y - a.y);
+  for (let s = 0; s < d; s += 10) {
+    const x = a.x + (b.x - a.x) * s / d, y = a.y + (b.y - a.y) * s / d;
+    for (const w of L.walls) if (x > w[0] && x < w[0] + w[2] && y > w[1] && y < w[1] + w[3]) return false;
+  }
+  return true;
+}
+
+function die() { scene = 'dead'; timer = 1; }
+
+function update(dt) {
+  let dx = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
+  let dy = (keys.KeyS || keys.ArrowDown ? 1 : 0) - (keys.KeyW || keys.ArrowUp ? 1 : 0);
+  if (mouse.down && !dx && !dy) {
+    const mx = mouse.x - player.x, my = mouse.y - player.y, d = Math.hypot(mx, my);
+    if (d > 12) { dx = mx / d; dy = my / d; }
+  }
+  const n = Math.hypot(dx, dy) || 1;
+  move(player, dx / n * 150 * dt, dy / n * 150 * dt, 14);
+
+  for (const m of mons) {
+    const dp = Math.hypot(player.x - m.x, player.y - m.y);
+    if (dp < 190 && los(m, player)) { m.chase = true; m.lost = 0; }
+    else if (m.chase) { m.lost += dt; if (m.lost > 2.5) m.chase = false; }
+    let tx, ty, sp;
+    if (m.chase) { tx = player.x; ty = player.y; sp = 130; }
+    else {
+      const p = m.path[m.i]; tx = p[0]; ty = p[1]; sp = 70;
+      if (Math.hypot(tx - m.x, ty - m.y) < 6) m.i = (m.i + 1) % m.path.length;
+    }
+    const a = Math.atan2(ty - m.y, tx - m.x);
+    move(m, Math.cos(a) * sp * dt, Math.sin(a) * sp * dt, 18);
+    if (dp < 30) { die(); return; }
+  }
+
+  const nt = L.note;
+  if (!nt.got && Math.hypot(player.x - nt.x, player.y - nt.y) < 28) {
+    nt.got = true; noteText = nt.text; scene = 'note'; return;
+  }
+  const e = L.exit;
+  if (player.x > e[0] && player.x < e[0] + e[2] && player.y > e[1] && player.y < e[1] + e[3]) {
+    if (lvl + 1 < LEVELS.length) loadLevel(lvl + 1); else scene = 'end';
+  }
+}
+
+// ---------- input ----------
+function pos(e) {
+  const r = cv.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) * W / r.width; mouse.y = (e.clientY - r.top) * H / r.height;
+}
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault(); pos(e); mouse.down = true;
+  if (scene === 'intro') { initPuzzle(); scene = 'puzzle'; }
+  else if (scene === 'note') scene = 'play';
+  else if (scene === 'end') { LEVELS.forEach(l => l.note.got = false); scene = 'intro'; }
+  else if (scene === 'puzzle' && !doorOpen) {
+    drag = objs.filter(o => Math.hypot(o.x - mouse.x, o.y - mouse.y) < o.r + 10)
+               .sort((a, b) => a.r - b.r)[0] || null;
+  }
+});
+cv.addEventListener('pointermove', pos);
+addEventListener('pointerup', () => { mouse.down = false; drag = null; });
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
+  if (scene === 'note' && ['Space', 'Enter', 'KeyE'].includes(e.code)) scene = 'play';
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ---------- drawing ----------
+function text(s, x, y, size, color, align) {
+  ctx.font = `bold ${size}px ${FONT}`; ctx.fillStyle = color; ctx.textAlign = align || 'center';
+  ctx.fillText(s, x, y);
+}
+function wrap(s, x, y, maxW, size, color, lh) {
+  ctx.font = `${size}px ${FONT}`; ctx.fillStyle = color; ctx.textAlign = 'center';
+  let line = '';
+  for (const w of s.split(' ')) {
+    if (ctx.measureText(line + w).width > maxW) { ctx.fillText(line, x, y); y += lh; line = ''; }
+    line += w + ' ';
+  }
+  ctx.fillText(line, x, y);
+}
+function panel(h) {
+  ctx.fillStyle = 'rgba(7,8,15,0.88)'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#1a1c33'; ctx.fillRect(140, 270 - h / 2, 680, h);
+}
+
+function drawPuzzle() {
+  ctx.fillStyle = '#14172e'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#1d2142'; ctx.fillRect(room.l, room.t, room.r - room.l, room.b - room.t);
+  ctx.fillStyle = '#2b2f57'; ctx.fillRect(room.l, room.b - 4, room.r - room.l, 60);
+  ctx.fillStyle = '#ffcf7a22'; ctx.fillRect(560, 60, 120, 90);          // window glow
+  ctx.strokeStyle = '#ffcf7a'; ctx.lineWidth = 3; ctx.strokeRect(560, 60, 120, 90);
+  ctx.fillStyle = '#3b2f4a'; ctx.fillRect(desk.x, desk.y, desk.w, desk.h);
+  ctx.fillStyle = '#4c3d5e'; ctx.fillRect(desk.x, desk.y, desk.w, 10);
+  // door + lock light
+  const open = Math.min(doorT / 1.2, 1);
+  ctx.fillStyle = '#5a3d2e'; ctx.fillRect(door.x, door.y, door.w + 40, door.h * (1 - open * 0.9));
+  ctx.fillStyle = doorOpen ? '#6bff9b' : '#ff3b3b'; ctx.fillRect(door.x + 30, door.y - 18, 14, 10);
+  // button
+  ctx.fillStyle = doorOpen ? '#2a8f55' : '#ff3b3b';
+  ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
+  for (const o of objs) {
+    ctx.fillStyle = o.c; ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, 7); ctx.fill();
+    ctx.strokeStyle = o === drag ? '#fff' : '#0006'; ctx.lineWidth = 3; ctx.stroke();
+  }
+  text('Drag and fling things. Hit the red button.', W / 2, 28, 18, '#9da3d9');
+  if (puzzleT > 35 && !doorOpen) text('Hint: light things fly higher. Try a quick flick.', W / 2, 515, 18, '#ffcf7a');
+}
+
+function drawPlay() {
+  ctx.fillStyle = '#1b1830'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#272244';
+  for (let x = 0; x < W; x += 80) ctx.fillRect(x, 0, 2, H);
+  const e = L.exit;
+  ctx.fillStyle = '#ffcf7a'; ctx.fillRect(e[0], e[1], e[2], e[3]);
+  text('EXIT', e[0] + e[2] / 2, e[1] + e[3] / 2 + 6, 16, '#3b2f4a');
+  ctx.fillStyle = '#3b3560';
+  for (const w of L.walls) ctx.fillRect(w[0], w[1], w[2], w[3]);
+  const nt = L.note;
+  if (!nt.got) { ctx.fillStyle = '#fff'; ctx.fillRect(nt.x - 8, nt.y - 10, 16, 20); }
+  for (const m of mons) {
+    ctx.fillStyle = '#0e0814'; ctx.beginPath(); ctx.arc(m.x, m.y, 18, 0, 7); ctx.fill();
+    ctx.fillStyle = m.chase ? '#ff3b3b' : '#ffe27a';
+    ctx.fillRect(m.x - 9, m.y - 6, 5, 7); ctx.fillRect(m.x + 4, m.y - 6, 5, 7);
+  }
+  if (scene !== 'dead') {
+    ctx.fillStyle = '#6bc5ff'; ctx.beginPath(); ctx.arc(player.x, player.y, 14, 0, 7); ctx.fill();
+    ctx.fillStyle = '#f3d2b8'; ctx.beginPath(); ctx.arc(player.x, player.y - 3, 9, 0, 7); ctx.fill();
+  }
+  // darkness around the boy
+  const g = ctx.createRadialGradient(player.x, player.y, 60, player.x, player.y, 300);
+  g.addColorStop(0, 'rgba(5,5,12,0)'); g.addColorStop(1, 'rgba(5,5,12,0.93)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  text('Move: WASD, arrows, or touch. Reach the exit. Don\'t get caught.', 16, 26, 16, '#9da3d9', 'left');
+  if (scene === 'dead') { ctx.fillStyle = 'rgba(120,0,0,0.45)'; ctx.fillRect(0, 0, W, H); text('Caught.', W / 2, H / 2, 54, '#fff'); }
+}
+
+function draw() {
+  if (scene === 'intro') {
+    ctx.fillStyle = '#0b0c1a'; ctx.fillRect(0, 0, W, H);
+    text('Back in Time', W / 2, 150, 64, '#fff');
+    text('Chapter 1: The Door', W / 2, 190, 24, '#ffcf7a');
+    wrap('Mom and Dad split up last year. Tonight you are home alone, and something is walking around the house. Your door just locked itself. Find a way out.', W / 2, 270, 560, 22, '#c9cdf0', 32);
+    text('Click or tap to start', W / 2, 440, 22, '#6bc5ff');
+  } else if (scene === 'puzzle') drawPuzzle();
+  else if (scene === 'end') {
+    drawPlay(); panel(300);
+    text('Chapter 1 complete', W / 2, 220, 40, '#fff');
+    wrap('You know they are real, but you still do not know what they are. Chapter 2 is coming soon.', W / 2, 280, 560, 22, '#c9cdf0', 32);
+    text('Click to play again', W / 2, 370, 20, '#6bc5ff');
+  } else {
+    drawPlay();
+    if (scene === 'note') {
+      panel(240);
+      wrap(noteText, W / 2, 245, 560, 24, '#fff', 34);
+      text('Click or press space to continue', W / 2, 360, 18, '#6bc5ff');
+    }
+  }
+}
+
+// ---------- main loop ----------
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.05); last = now;
+  if (scene === 'puzzle') {
+    puzzleT += dt;
+    for (let i = 0; i < 4; i++) physics(dt / 4);
+    if (doorOpen) { doorT += dt; if (doorT > 1.6) loadLevel(0); }
+  } else if (scene === 'play') update(dt);
+  else if (scene === 'dead') { timer -= dt; if (timer < 0) loadLevel(lvl); }
+  draw();
+  requestAnimationFrame(loop);
+}
+initPuzzle();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
