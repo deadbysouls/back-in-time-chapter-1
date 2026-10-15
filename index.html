@@ -21,8 +21,7 @@ const FONT = '"Trebuchet MS", system-ui, sans-serif';
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 let scene = 'intro', mouse = { x: 0, y: 0, down: false }, keys = {};
-let timer = 0, noteText = '', lvl = 0, L, player, mons, objs, drag = null;
-let doorOpen = false, doorT = 0, puzzleT = 0;
+let timer = 0, noteText = '', lvl = 0, L, player, mons;
 
 // ---------- chapter data ----------
 const LEVELS = [
@@ -36,21 +35,118 @@ const LEVELS = [
     note: { x: 300, y: 490, got: false, text: "Dad's old phone. One bar of signal. First I have to find out what they are. Then I call the police." } }
 ];
 
-// ---------- puzzle room ----------
-const room = { l: 40, r: 920, t: 40, b: 480 };
-const desk = { x: 330, y: 390, w: 180, h: 90 };
-const btn = { x: 900, y: 110, w: 20, h: 44 };
-const door = { x: 40, y: 360, w: 14, h: 120 };
-
-function initPuzzle() {
-  objs = [
-    { x: 200, y: 300, vx: 0, vy: 0, r: 16, m: 1,   c: '#ff6b6b' },
-    { x: 300, y: 300, vx: 0, vy: 0, r: 24, m: 2.5, c: '#ffd24d' },
-    { x: 120, y: 300, vx: 0, vy: 0, r: 30, m: 5,   c: '#6bc5ff' }
-  ];
-  doorOpen = false; doorT = 0; puzzleT = 0; drag = null;
+// ---------- sound, particles and animation ----------
+let AC = null, master = null, sfxOn = true, lastBump = 0;
+let hp = 100, hurtT = 0, regenT = 0, shake = 0, fade = 0, anim = 0, walk = 0, face = 1, stepT = 0, beatT = 0, melT = 0, parts = [];
+function audio() {
+  if (AC) return;
+  try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+  master = AC.createGain(); master.gain.value = 0.5; master.connect(AC.destination);
+  const g = AC.createGain(), lg = AC.createGain(), lfo = AC.createOscillator();
+  g.gain.value = 0.05; lg.gain.value = 0.025; lfo.frequency.value = 0.15;
+  lfo.connect(lg); lg.connect(g.gain); g.connect(master); lfo.start();
+  [55, 82.6].forEach(f => { const o = AC.createOscillator(); o.frequency.value = f; o.connect(g); o.start(); });
+}
+function tone(f, d, type, v, to) {
+  if (!AC) return;
+  const t = AC.currentTime, o = AC.createOscillator(), g = AC.createGain();
+  o.type = type || 'sine'; o.frequency.setValueAtTime(f, t);
+  if (to) o.frequency.exponentialRampToValueAtTime(to, t + d);
+  g.gain.setValueAtTime(v || 0.2, t); g.gain.exponentialRampToValueAtTime(0.001, t + d);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + d);
+}
+function noiseBurst(d, v, f) {
+  if (!AC) return;
+  const n = AC.sampleRate * d | 0, b = AC.createBuffer(1, n, AC.sampleRate), c = b.getChannelData(0);
+  for (let i = 0; i < n; i++) c[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const s = AC.createBufferSource(), g = AC.createGain(), fl = AC.createBiquadFilter();
+  fl.type = 'lowpass'; fl.frequency.value = f; g.gain.value = v;
+  s.buffer = b; s.connect(fl); fl.connect(g); g.connect(master); s.start();
+}
+const SFX = {
+  grab: () => tone(520, 0.08, 'sine', 0.12, 780),
+  bounce: v => tone(150 + Math.random() * 40, 0.14, 'triangle', Math.min(v / 1600, 0.25), 70),
+  button: () => { tone(660, 0.25, 'square', 0.1); setTimeout(() => tone(990, 0.35, 'square', 0.08), 90); },
+  door: () => { tone(90, 1.1, 'sawtooth', 0.12, 170); setTimeout(() => tone(523, 0.5, 'triangle', 0.12), 500); },
+  note: () => { tone(880, 0.2, 'sine', 0.15); setTimeout(() => tone(1320, 0.3, 'sine', 0.12), 110); },
+  hit: () => { noiseBurst(0.25, 0.4, 600); tone(110, 0.3, 'sine', 0.3, 45); },
+  dead: () => tone(220, 1.2, 'sawtooth', 0.16, 40),
+  beat: () => { tone(60, 0.12, 'sine', 0.35, 40); setTimeout(() => tone(55, 0.14, 'sine', 0.3, 38), 160); },
+  step: () => noiseBurst(0.05, 0.06, 400),
+  roar: () => tone(170, 0.5, 'sawtooth', 0.1, 70),
+  exit: () => [523, 659, 784].forEach((f, i) => setTimeout(() => tone(f, 0.3, 'triangle', 0.14), i * 100))
+};
+const PENT = [261.6, 293.7, 329.6, 392, 440, 523.3, 587.3];
+function melody(dt) { melT -= dt; if (melT <= 0) { tone(PENT[Math.random() * PENT.length | 0], 2, 'sine', 0.05); melT = 1 + Math.random() * 1.6; } }
+function bump(o, v) {
+  o.sq = 1; const t = performance.now();
+  if (t - lastBump > 60) { lastBump = t; SFX.bounce(v); }
+  if (v > 350) burst(o.x, o.y + o.r, '#8a8fc0', 4);
+}
+function burst(x, y, c, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * 6.28, sp = 60 + Math.random() * 180;
+    parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 60, life: 0.6 + Math.random() * 0.4, c });
+  }
+}
+function stepFx(dt) {
+  anim += dt; shake = Math.max(0, shake - dt); fade = Math.max(0, fade - dt * 1.6);
+  for (const p of parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 300 * dt; p.life -= dt; }
+  parts = parts.filter(p => p.life > 0);
+  if (objs) for (const o of objs) o.sq = Math.max(0, (o.sq || 0) - dt * 5);
+}
+function drawFx() {
+  for (const p of parts) { ctx.globalAlpha = Math.min(1, p.life * 2); ctx.fillStyle = p.c; ctx.fillRect(p.x - 3, p.y - 3, 6, 6); }
+  ctx.globalAlpha = 1;
+  if (fade > 0) { ctx.fillStyle = `rgba(7,8,15,${fade})`; ctx.fillRect(0, 0, W, H); }
+}
+function drawMotes() {
+  ctx.fillStyle = 'rgba(255,230,170,0.25)';
+  for (let i = 0; i < 26; i++) {
+    const x = (i * 97 + anim * (6 + i % 4 * 3)) % W, y = (i * 53 + Math.sin(anim * 0.7 + i) * 20 + 40) % H;
+    ctx.fillRect(x, y, 2, 2);
+  }
+}
+function hurt(m) {
+  hp -= 25; hurtT = 1.2; regenT = 0; shake = 0.35; m.cd = 0.8;
+  const a = Math.atan2(player.y - m.y, player.x - m.x);
+  move(player, Math.cos(a) * 45, Math.sin(a) * 45, 14);
+  burst(player.x, player.y, '#ff5a5a', 14); SFX.hit();
+  if (hp <= 0) die();
 }
 
+// ---------- safe physics puzzle rooms (no monsters) ----------
+// objs: [x, y, radius, mass, color]; plats/btns: [x, y, w, h]; plates: [x, y, w, h, weightNeeded]
+const room = { l: 40, r: 920, t: 40, b: 480 };
+const door = { x: 40, y: 360, w: 14, h: 120 };
+const PZ = [
+  { t: 'Safe room. Drag and fling things. Hit the red button.', hint: 'Light things fly higher. Try a quick flick.',
+    objs: [[200,300,16,1,'#ff6b6b'],[300,300,24,2.5,'#ffd24d'],[120,300,30,5,'#6bc5ff']],
+    plats: [[330,390,180,90]], btns: [[900,110,20,44]], plates: [] },
+  { t: 'Safe room. Get enough weight onto the yellow plate.', hint: 'Lift heavy things over the wall with the mouse. They sag, so go high.',
+    objs: [[100,430,20,1.5,'#ff6b6b'],[200,430,26,3,'#ffd24d'],[300,430,32,5,'#6bc5ff']],
+    plats: [[460,300,30,180]], btns: [], plates: [[620,470,200,10,7]] },
+  { t: 'Safe room. Hit both red buttons.', hint: 'One button is on the ceiling and one on the left wall. Bounce things off the floor.',
+    objs: [[200,430,16,1,'#ff6b6b'],[300,430,20,1.5,'#ffd24d'],[420,430,30,5,'#6bc5ff']],
+    plats: [[500,380,120,100]], btns: [[40,100,20,44],[470,40,70,16]], plates: [] },
+  { t: 'Safe room. Weigh down the plate and hit the button.', hint: 'The plate needs weight 6. The button needs a fast hit.',
+    objs: [[150,430,16,1,'#ff6b6b'],[250,430,28,4,'#ffd24d'],[350,430,30,5,'#6bc5ff']],
+    plats: [[300,330,120,20],[560,260,100,20]], btns: [[900,110,20,44]], plates: [[640,470,200,10,6]] }
+];
+const SEQ = [['p',0],['p',1],['l',0],['p',2],['p',3],['l',1]];
+let stage = -1, P, objs, bh, drag = null, doorOpen = false, doorT = 0, puzzleT = 0;
+
+function nextStage() {
+  stage++; fade = 1;
+  if (stage >= SEQ.length) { scene = 'end'; return; }
+  const [k, i] = SEQ[stage];
+  if (k === 'p') initPuzzle(i); else loadLevel(i);
+}
+function initPuzzle(i) {
+  P = PZ[i]; scene = 'puzzle';
+  objs = P.objs.map(a => ({ x: a[0], y: a[1], vx: 0, vy: 0, r: a[2], m: a[3], c: a[4] }));
+  bh = P.btns.map(() => false); doorOpen = false; doorT = 0; puzzleT = 0; drag = null;
+}
 function physics(dt) {
   for (const o of objs) {
     if (o === drag) {
@@ -61,25 +157,28 @@ function physics(dt) {
     const sp = Math.hypot(o.vx, o.vy);
     if (sp > 1100) { o.vx *= 1100 / sp; o.vy *= 1100 / sp; }
     o.x += o.vx * dt; o.y += o.vy * dt;
-    if (o.x < room.l + o.r) { o.x = room.l + o.r; o.vx = Math.abs(o.vx) * 0.5; }
-    if (o.x > room.r - o.r) { o.x = room.r - o.r; o.vx = -Math.abs(o.vx) * 0.5; }
+    if (o.x < room.l + o.r) { if (o.vx < -200) bump(o, -o.vx); o.x = room.l + o.r; o.vx = Math.abs(o.vx) * 0.5; }
+    if (o.x > room.r - o.r) { if (o.vx > 200) bump(o, o.vx); o.x = room.r - o.r; o.vx = -Math.abs(o.vx) * 0.5; }
     if (o.y < room.t + o.r) { o.y = room.t + o.r; o.vy = Math.abs(o.vy) * 0.5; }
     if (o.y > room.b - o.r) {
+      if (o.vy > 200) bump(o, o.vy);
       o.y = room.b - o.r; o.vy = -Math.abs(o.vy) * 0.45; o.vx *= 1 - 1.2 * dt;
       if (Math.abs(o.vy) < 30) o.vy = 0;
     }
-    // desk collision
-    const cx = clamp(o.x, desk.x, desk.x + desk.w), cy = clamp(o.y, desk.y, desk.y + desk.h);
-    const dx = o.x - cx, dy = o.y - cy, d = Math.hypot(dx, dy);
-    if (d < o.r && d > 0) {
-      const nx = dx / d, ny = dy / d;
-      o.x += nx * (o.r - d); o.y += ny * (o.r - d);
-      const vn = o.vx * nx + o.vy * ny;
-      if (vn < 0) { o.vx -= 1.45 * vn * nx; o.vy -= 1.45 * vn * ny; }
-    } else if (d === 0) o.y = desk.y - o.r;
-    // red button: needs a hard hit
-    const bx = clamp(o.x, btn.x, btn.x + btn.w), by = clamp(o.y, btn.y, btn.y + btn.h);
-    if (!doorOpen && Math.hypot(o.x - bx, o.y - by) < o.r + 1 && Math.hypot(o.vx, o.vy) > 250) doorOpen = true;
+    for (const q of P.plats) {
+      const cx = clamp(o.x, q[0], q[0] + q[2]), cy = clamp(o.y, q[1], q[1] + q[3]);
+      const dx = o.x - cx, dy = o.y - cy, d = Math.hypot(dx, dy);
+      if (d < o.r && d > 0) {
+        const nx = dx / d, ny = dy / d;
+        o.x += nx * (o.r - d); o.y += ny * (o.r - d);
+        const vn = o.vx * nx + o.vy * ny;
+        if (vn < 0) { if (vn < -200) bump(o, -vn); o.vx -= 1.45 * vn * nx; o.vy -= 1.45 * vn * ny; }
+      } else if (d === 0) o.y = q[1] - o.r;
+    }
+    P.btns.forEach((b, k) => {
+      const bx = clamp(o.x, b[0], b[0] + b[2]), by = clamp(o.y, b[1], b[1] + b[3]);
+      if (Math.hypot(o.x - bx, o.y - by) < o.r + 1 && Math.hypot(o.vx, o.vy) > 250 && !bh[k]) { bh[k] = true; SFX.button(); burst(bx, by, '#ffd24d', 18); }
+    });
   }
   for (let i = 0; i < objs.length; i++) for (let j = i + 1; j < objs.length; j++) {
     const a = objs[i], b = objs[j], dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1;
@@ -95,11 +194,44 @@ function physics(dt) {
       }
     }
   }
+  if (!doorOpen && bh.every(Boolean) && P.plates.every((q, k) => plateW(q) >= q[4])) { doorOpen = true; SFX.door(); burst(door.x + 30, door.y + 40, '#6bff9b', 30); }
+}
+function plateW(q) {
+  return objs.filter(o => o.x > q[0] && o.x < q[0] + q[2] && o.y + o.r > q[1]).reduce((s, o) => s + o.m, 0);
+}
+function drawPuzzle() {
+  ctx.fillStyle = '#14172e'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#1d2142'; ctx.fillRect(room.l, room.t, room.r - room.l, room.b - room.t);
+  ctx.fillStyle = '#2b2f57'; ctx.fillRect(room.l, room.b, room.r - room.l, 60);
+  drawMotes();
+  ctx.fillStyle = '#3b2f4a';
+  for (const q of P.plats) ctx.fillRect(q[0], q[1], q[2], q[3]);
+  for (const q of P.plates) {
+    ctx.fillStyle = plateW(q) >= q[4] ? '#6bff9b' : '#ffd24d'; ctx.fillRect(q[0], q[1], q[2], q[3]);
+    text('Weight ' + plateW(q).toFixed(1) + ' / ' + q[4], q[0] + q[2] / 2, q[1] - 10, 15, '#ffe9a8');
+  }
+  const open = Math.min(doorT / 1.2, 1);
+  ctx.fillStyle = '#5a3d2e'; ctx.fillRect(door.x, door.y, door.w + 40, door.h * (1 - open * 0.9));
+  ctx.fillStyle = doorOpen ? '#6bff9b' : '#ff3b3b'; ctx.fillRect(door.x + 30, door.y - 18, 14, 10);
+  P.btns.forEach((b, k) => {
+    if (!bh[k]) { ctx.fillStyle = `rgba(255,59,59,${0.15 + 0.15 * Math.sin(anim * 4)})`; ctx.fillRect(b[0] - 6, b[1] - 6, b[2] + 12, b[3] + 12); }
+    ctx.fillStyle = bh[k] ? '#2a8f55' : '#ff3b3b'; ctx.fillRect(b[0], b[1], b[2], b[3]);
+  });
+  for (const o of objs) {
+    ctx.save(); ctx.translate(o.x, o.y); const q = o.sq || 0; ctx.scale(1 + q * 0.25, 1 - q * 0.25);
+    ctx.fillStyle = o.c; ctx.beginPath(); ctx.arc(0, 0, o.r, 0, 7); ctx.fill();
+    ctx.strokeStyle = o === drag ? '#fff' : '#0006'; ctx.lineWidth = o === drag ? 4 + Math.sin(anim * 10) : 3; ctx.stroke();
+    const blink = Math.sin(anim * 1.3 + o.m) > 0.96 ? 1 : 4;
+    ctx.fillStyle = '#16113a'; ctx.fillRect(-o.r * 0.4, -o.r * 0.2, 4, blink); ctx.fillRect(o.r * 0.2, -o.r * 0.2, 4, blink);
+    ctx.restore();
+  }
+  text(P.t, W / 2, 28, 18, '#9da3d9');
+  if (puzzleT > 35 && !doorOpen) text('Hint: ' + P.hint, W / 2, 520, 17, '#ffcf7a');
 }
 
 // ---------- survival levels ----------
 function loadLevel(i) {
-  lvl = i; L = LEVELS[i];
+  lvl = i; L = LEVELS[i]; hp = 100; hurtT = 0; regenT = 0; fade = 1;
   player = { x: L.start[0], y: L.start[1] };
   mons = L.mons.map(p => ({ x: p[0][0], y: p[0][1], path: p, i: 1, chase: false, lost: 0 }));
   scene = 'play';
@@ -123,9 +255,10 @@ function los(a, b) {
   return true;
 }
 
-function die() { scene = 'dead'; timer = 1; }
+function die() { scene = 'dead'; timer = 1; SFX.dead(); burst(player.x, player.y, '#6bc5ff', 20); }
 
 function update(dt) {
+  hurtT -= dt; regenT += dt; if (regenT > 6 && hp < 100) hp = Math.min(100, hp + 8 * dt);
   let dx = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
   let dy = (keys.KeyS || keys.ArrowDown ? 1 : 0) - (keys.KeyW || keys.ArrowUp ? 1 : 0);
   if (mouse.down && !dx && !dy) {
@@ -134,10 +267,14 @@ function update(dt) {
   }
   const n = Math.hypot(dx, dy) || 1;
   move(player, dx / n * 150 * dt, dy / n * 150 * dt, 14);
+  if (dx || dy) { if (dx) face = dx > 0 ? 1 : -1; walk += dt * 12; stepT -= dt; if (stepT <= 0) { SFX.step(); stepT = 0.3; } }
+  const anyChase = mons.some(m => m.chase); beatT -= dt;
+  if (anyChase && beatT <= 0) { SFX.beat(); beatT = 0.7; }
 
   for (const m of mons) {
+    if (m.cd > 0) { m.cd -= dt; continue; }
     const dp = Math.hypot(player.x - m.x, player.y - m.y);
-    if (dp < 190 && los(m, player)) { m.chase = true; m.lost = 0; }
+    if (dp < 190 && los(m, player)) { if (!m.chase) SFX.roar(); m.chase = true; m.lost = 0; }
     else if (m.chase) { m.lost += dt; if (m.lost > 2.5) m.chase = false; }
     let tx, ty, sp;
     if (m.chase) { tx = player.x; ty = player.y; sp = 130; }
@@ -147,16 +284,16 @@ function update(dt) {
     }
     const a = Math.atan2(ty - m.y, tx - m.x);
     move(m, Math.cos(a) * sp * dt, Math.sin(a) * sp * dt, 18);
-    if (dp < 30) { die(); return; }
+    if (dp < 30 && hurtT <= 0) { hurt(m); if (scene === 'dead') return; }
   }
 
   const nt = L.note;
   if (!nt.got && Math.hypot(player.x - nt.x, player.y - nt.y) < 28) {
-    nt.got = true; noteText = nt.text; scene = 'note'; return;
+    nt.got = true; noteText = nt.text; scene = 'note'; SFX.note(); burst(nt.x, nt.y, '#fff', 14); return;
   }
   const e = L.exit;
   if (player.x > e[0] && player.x < e[0] + e[2] && player.y > e[1] && player.y < e[1] + e[3]) {
-    if (lvl + 1 < LEVELS.length) loadLevel(lvl + 1); else scene = 'end';
+    SFX.exit(); burst(player.x, player.y, '#ffcf7a', 20); nextStage();
   }
 }
 
@@ -166,19 +303,20 @@ function pos(e) {
   mouse.x = (e.clientX - r.left) * W / r.width; mouse.y = (e.clientY - r.top) * H / r.height;
 }
 cv.addEventListener('pointerdown', e => {
-  e.preventDefault(); pos(e); mouse.down = true;
-  if (scene === 'intro') { initPuzzle(); scene = 'puzzle'; }
+  e.preventDefault(); pos(e); mouse.down = true; audio();
+  if (scene === 'intro') { stage = -1; nextStage(); }
   else if (scene === 'note') scene = 'play';
   else if (scene === 'end') { LEVELS.forEach(l => l.note.got = false); scene = 'intro'; }
   else if (scene === 'puzzle' && !doorOpen) {
     drag = objs.filter(o => Math.hypot(o.x - mouse.x, o.y - mouse.y) < o.r + 10)
                .sort((a, b) => a.r - b.r)[0] || null;
+    if (drag) SFX.grab();
   }
 });
 cv.addEventListener('pointermove', pos);
 addEventListener('pointerup', () => { mouse.down = false; drag = null; });
 addEventListener('keydown', e => {
-  keys[e.code] = true;
+  keys[e.code] = true; audio(); if (e.code === 'KeyM' && master) { sfxOn = !sfxOn; master.gain.value = sfxOn ? 0.5 : 0; }
   if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
   if (scene === 'note' && ['Space', 'Enter', 'KeyE'].includes(e.code)) scene = 'play';
 });
@@ -203,29 +341,6 @@ function panel(h) {
   ctx.fillStyle = '#1a1c33'; ctx.fillRect(140, 270 - h / 2, 680, h);
 }
 
-function drawPuzzle() {
-  ctx.fillStyle = '#14172e'; ctx.fillRect(0, 0, W, H);
-  ctx.fillStyle = '#1d2142'; ctx.fillRect(room.l, room.t, room.r - room.l, room.b - room.t);
-  ctx.fillStyle = '#2b2f57'; ctx.fillRect(room.l, room.b - 4, room.r - room.l, 60);
-  ctx.fillStyle = '#ffcf7a22'; ctx.fillRect(560, 60, 120, 90);          // window glow
-  ctx.strokeStyle = '#ffcf7a'; ctx.lineWidth = 3; ctx.strokeRect(560, 60, 120, 90);
-  ctx.fillStyle = '#3b2f4a'; ctx.fillRect(desk.x, desk.y, desk.w, desk.h);
-  ctx.fillStyle = '#4c3d5e'; ctx.fillRect(desk.x, desk.y, desk.w, 10);
-  // door + lock light
-  const open = Math.min(doorT / 1.2, 1);
-  ctx.fillStyle = '#5a3d2e'; ctx.fillRect(door.x, door.y, door.w + 40, door.h * (1 - open * 0.9));
-  ctx.fillStyle = doorOpen ? '#6bff9b' : '#ff3b3b'; ctx.fillRect(door.x + 30, door.y - 18, 14, 10);
-  // button
-  ctx.fillStyle = doorOpen ? '#2a8f55' : '#ff3b3b';
-  ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
-  for (const o of objs) {
-    ctx.fillStyle = o.c; ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, 7); ctx.fill();
-    ctx.strokeStyle = o === drag ? '#fff' : '#0006'; ctx.lineWidth = 3; ctx.stroke();
-  }
-  text('Drag and fling things. Hit the red button.', W / 2, 28, 18, '#9da3d9');
-  if (puzzleT > 35 && !doorOpen) text('Hint: light things fly higher. Try a quick flick.', W / 2, 515, 18, '#ffcf7a');
-}
-
 function drawPlay() {
   ctx.fillStyle = '#1b1830'; ctx.fillRect(0, 0, W, H);
   ctx.fillStyle = '#272244';
@@ -238,29 +353,50 @@ function drawPlay() {
   const nt = L.note;
   if (!nt.got) { ctx.fillStyle = '#fff'; ctx.fillRect(nt.x - 8, nt.y - 10, 16, 20); }
   for (const m of mons) {
-    ctx.fillStyle = '#0e0814'; ctx.beginPath(); ctx.arc(m.x, m.y, 18, 0, 7); ctx.fill();
+    const pr = 18 + Math.sin(anim * (m.chase ? 12 : 4) + m.x) * (m.chase ? 3 : 1.5);
+    ctx.shadowColor = m.chase ? '#ff3b3b' : '#6a3bff'; ctx.shadowBlur = 14;
+    ctx.fillStyle = '#0e0814'; ctx.beginPath(); ctx.arc(m.x, m.y, pr, 0, 7); ctx.fill(); ctx.shadowBlur = 0;
+    const lx = clamp((player.x - m.x) / 40, -1, 1) * 2, ly = clamp((player.y - m.y) / 40, -1, 1) * 2;
     ctx.fillStyle = m.chase ? '#ff3b3b' : '#ffe27a';
-    ctx.fillRect(m.x - 9, m.y - 6, 5, 7); ctx.fillRect(m.x + 4, m.y - 6, 5, 7);
+    ctx.fillRect(m.x - 9 + lx, m.y - 6 + ly, 5, 7); ctx.fillRect(m.x + 4 + lx, m.y - 6 + ly, 5, 7);
   }
-  if (scene !== 'dead') {
-    ctx.fillStyle = '#6bc5ff'; ctx.beginPath(); ctx.arc(player.x, player.y, 14, 0, 7); ctx.fill();
-    ctx.fillStyle = '#f3d2b8'; ctx.beginPath(); ctx.arc(player.x, player.y - 3, 9, 0, 7); ctx.fill();
+  if (scene !== 'dead' && !(hurtT > 0 && Math.floor(anim * 20) % 2)) {
+    const bob = Math.abs(Math.sin(walk)) * 3;
+    ctx.fillStyle = '#0005'; ctx.beginPath(); ctx.ellipse(player.x, player.y + 14, 12, 4, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = '#6bc5ff'; ctx.beginPath(); ctx.arc(player.x, player.y - bob, 14, 0, 7); ctx.fill();
+    ctx.fillStyle = '#f3d2b8'; ctx.beginPath(); ctx.arc(player.x, player.y - 3 - bob, 9, 0, 7); ctx.fill();
+    ctx.fillStyle = '#222'; ctx.fillRect(player.x + face * 3 - 3, player.y - 6 - bob, 2, 3); ctx.fillRect(player.x + face * 3 + 2, player.y - 6 - bob, 2, 3);
   }
   // darkness around the boy
   const g = ctx.createRadialGradient(player.x, player.y, 60, player.x, player.y, 300);
   g.addColorStop(0, 'rgba(5,5,12,0)'); g.addColorStop(1, 'rgba(5,5,12,0.93)');
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  if (hurtT > 0) { ctx.fillStyle = `rgba(200,0,0,${hurtT * 0.25})`; ctx.fillRect(0, 0, W, H); }
+  ctx.fillStyle = '#2b2f57'; ctx.fillRect(W - 196, 14, 180, 14);
+  ctx.fillStyle = hp > 40 ? '#6bff9b' : '#ff5a5a'; ctx.fillRect(W - 196, 14, 180 * Math.max(hp, 0) / 100, 14);
+  text('Health', W - 204, 27, 14, '#c9cdf0', 'right');
   text('Move: WASD, arrows, or touch. Reach the exit. Don\'t get caught.', 16, 26, 16, '#9da3d9', 'left');
   if (scene === 'dead') { ctx.fillStyle = 'rgba(120,0,0,0.45)'; ctx.fillRect(0, 0, W, H); text('Caught.', W / 2, H / 2, 54, '#fff'); }
 }
 
 function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate((Math.random() - 0.5) * shake * 30, (Math.random() - 0.5) * shake * 30);
+  drawScene(); drawFx();
+  ctx.restore();
+}
+function drawScene() {
   if (scene === 'intro') {
     ctx.fillStyle = '#0b0c1a'; ctx.fillRect(0, 0, W, H);
-    text('Back in Time', W / 2, 150, 64, '#fff');
+    for (let i = 0; i < 5; i++) {
+      const ex = 100 + i * 190, ey = 80 + (i % 2) * 380;
+      if (Math.sin(anim * 0.8 + i * 2) > 0.3) { ctx.fillStyle = '#ff3b3b'; ctx.fillRect(ex, ey, 6, 8); ctx.fillRect(ex + 16, ey, 6, 8); }
+    }
+    text('Back in Time', W / 2, 150 + Math.sin(anim * 2) * 5, 64, '#fff');
     text('Chapter 1: The Door', W / 2, 190, 24, '#ffcf7a');
     wrap('Mom and Dad split up last year. Tonight you are home alone, and something is walking around the house. Your door just locked itself. Find a way out.', W / 2, 270, 560, 22, '#c9cdf0', 32);
     text('Click or tap to start', W / 2, 440, 22, '#6bc5ff');
+    text('Drag and fling things. Sneak past monsters. M to mute.', W / 2, 480, 16, '#8d93c8');
   } else if (scene === 'puzzle') drawPuzzle();
   else if (scene === 'end') {
     drawPlay(); panel(300);
@@ -281,16 +417,17 @@ function draw() {
 let last = performance.now();
 function loop(now) {
   const dt = Math.min((now - last) / 1000, 0.05); last = now;
+  stepFx(dt);
   if (scene === 'puzzle') {
+    melody(dt);
     puzzleT += dt;
     for (let i = 0; i < 4; i++) physics(dt / 4);
-    if (doorOpen) { doorT += dt; if (doorT > 1.6) loadLevel(0); }
+    if (doorOpen) { doorT += dt; if (doorT > 1.6) nextStage(); }
   } else if (scene === 'play') update(dt);
   else if (scene === 'dead') { timer -= dt; if (timer < 0) loadLevel(lvl); }
   draw();
   requestAnimationFrame(loop);
 }
-initPuzzle();
 requestAnimationFrame(loop);
 </script>
 </body>
